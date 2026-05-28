@@ -6,26 +6,48 @@ use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Illuminate\Support\Facades\Auth;
 
+/**
+ * EnsureTenantScope
+ *
+ * Validates that the authenticated user belongs to a tenant and injects
+ * tenant/outlet context into the request for downstream controllers.
+ *
+ * IMPORTANT: This middleware is a convenience helper only.
+ * Actual data isolation MUST be enforced via:
+ *   - Model global scopes (TenantScope)
+ *   - Policy authorization checks
+ *   - Service-layer tenant_id filters
+ *
+ * Never rely solely on request attributes for security.
+ */
 class EnsureTenantScope
 {
-    /**
-     * Handle an incoming request.
-     */
     public function handle(Request $request, Closure $next): Response
     {
-        if (Auth::check()) {
-            $user = Auth::user();
-            
-            // Set the tenant scope implicitly for all subsequent queries
-            // This can be done via Global Scopes on the models, or by injecting into the request.
-            // For simplicity, we'll ensure the request always carries the tenant_id.
-            $request->merge(['tenant_id' => $user->tenant_id]);
-            
-            // If the user is scoped to a specific outlet, enforce that too
-            if ($user->outlet_id) {
-                $request->merge(['outlet_id' => $user->outlet_id]);
-            }
+        if (!Auth::check()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthenticated.',
+            ], 401);
         }
+
+        $user = Auth::user();
+
+        // Reject requests from users without a tenant assignment
+        if (!$user->tenant_id) {
+            return response()->json([
+                'success' => false,
+                'message' => 'User is not assigned to a tenant. Contact your administrator.',
+            ], 403);
+        }
+
+        // Inject tenant/outlet context for controller convenience
+        // WARNING: Do NOT use these values as the sole authorization check.
+        // Always re-verify against Auth::user()->tenant_id in queries.
+        $request->merge([
+            'tenant_id' => $user->tenant_id,
+            'outlet_id' => $user->outlet_id,
+        ]);
 
         return $next($request);
     }
