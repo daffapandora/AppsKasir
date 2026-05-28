@@ -1,5 +1,17 @@
+/**
+ * cartStore.ts
+ * Zustand store for POS cart state.
+ *
+ * FIXES APPLIED:
+ * - Extracted calculateCartTotals() pure function (DRY – was repeated 8x)
+ * - Fixed taxableBase = Math.max(0, ...) to prevent negative tax on over-discount
+ * - Used crypto.randomUUID() for cart item IDs (was Date.now + Math.random)
+ * - persist() partializes correctly to preserve cart across page refresh
+ */
+
 import { create } from 'zustand';
 import { devtools, persist } from 'zustand/middleware';
+import { generateUUID } from '@/lib/api/generateUUID';
 
 export interface CartItem {
   id: string;
@@ -14,20 +26,31 @@ export interface CartItem {
   image?: string;
 }
 
-export interface CartState {
-  items: CartItem[];
+export interface CartDiscount {
+  type: 'PERCENTAGE' | 'FIXED';
+  value: number;
+  code?: string;
+}
+
+export interface CartTotals {
   subtotal: number;
   discountAmount: number;
   taxAmount: number;
   totalAmount: number;
+}
+
+export interface CartState extends CartTotals {
+  items: CartItem[];
   customerName?: string;
   customerPhone?: string;
   customerId?: number;
-  discounts: Array<{ type: 'PERCENTAGE' | 'FIXED'; value: number; code?: string }>;
+  discounts: CartDiscount[];
+  /** Client UUID for this checkout session. Set once, reused on retry. */
+  checkoutUUID: string;
 }
 
 interface CartActions {
-  addItem: (item: CartItem) => void;
+  addItem: (item: Omit<CartItem, 'id'>) => void;
   removeItem: (itemId: string) => void;
   updateItem: (itemId: string, updates: Partial<CartItem>) => void;
   incrementQuantity: (itemId: string) => void;
@@ -36,8 +59,30 @@ interface CartActions {
   removeDiscount: (index: number) => void;
   setCustomer: (name: string, phone: string, id?: number) => void;
   clear: () => void;
-  calculateTotals: () => void;
+  regenerateCheckoutUUID: () => void;
 }
+
+// ─── Pure helper function (no store dependency) ───────────────────────────────
+
+export function calculateCartTotals(items: CartItem[], discounts: CartDiscount[]): CartTotals {
+  const subtotal = items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
+
+  const rawDiscount = discounts.reduce((sum, d) => {
+    return d.type === 'PERCENTAGE'
+      ? sum + (subtotal * Math.min(100, d.value)) / 100
+      : sum + d.value;
+  }, 0);
+
+  // Cap discount at subtotal to prevent negative totals
+  const discountAmount = Math.min(rawDiscount, subtotal);
+  const taxableBase    = Math.max(0, subtotal - discountAmount);
+  const taxAmount      = taxableBase * 0.1; // 10% PPN
+  const totalAmount    = taxableBase + taxAmount;
+
+  return { subtotal, discountAmount, taxAmount, totalAmount };
+}
+
+// ─── Initial state ─────────────────────────────────────────────────────────────
 
 const initialState: CartState = {
   items: [],
@@ -46,165 +91,105 @@ const initialState: CartState = {
   taxAmount: 0,
   totalAmount: 0,
   discounts: [],
+  checkoutUUID: generateUUID(),
 };
+
+// ─── Store ────────────────────────────────────────────────────────────────────
 
 export const useCartStore = create<CartState & CartActions>()(
   devtools(
     persist(
-      (set, get) => ({
+      (set) => ({
         ...initialState,
 
-        addItem: (item) =>
+        addItem: (itemData) =>
           set((state) => {
-            // Check if item already exists (same product + variant)
-            const existingIndex = state.items.findIndex(
+            const existingIdx = state.items.findIndex(
               (i) =>
-                i.productId === item.productId &&
-                i.productVariantId === item.productVariantId
+                i.productId === itemData.productId &&
+                i.productVariantId === itemData.productVariantId
             );
 
-            let newItems: CartItem[];
-            if (existingIndex >= 0) {
-              // Increment quantity of existing item
-              newItems = [...state.items];
-              newItems[existingIndex].quantity += item.quantity;
+            let items: CartItem[];
+            if (existingIdx >= 0) {
+              items = state.items.map((item, idx) =>
+                idx === existingIdx
+                  ? { ...item, quantity: item.quantity + (itemData.quantity ?? 1) }
+                  : item
+              );
             } else {
-              // Add new item with unique ID
-              newItems = [...state.items, { ...item, id: `${Date.now()}-${Math.random()}` }];
+              items = [
+                ...state.items,
+                { ...itemData, id: generateUUID() },
+              ];
             }
 
-            // Recalculate totals after adding
-            const subtotal = newItems.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1; // 10% tax
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return {
-              items: newItems,
-              subtotal,
-              discountAmount,
-              taxAmount,
-              totalAmount,
-            };
+            return { items, ...calculateCartTotals(items, state.discounts) };
           }),
 
         removeItem: (itemId) =>
           set((state) => {
-            const newItems = state.items.filter((i) => i.id !== itemId);
-            const subtotal = newItems.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { items: newItems, subtotal, discountAmount, taxAmount, totalAmount };
+            const items = state.items.filter((i) => i.id !== itemId);
+            return { items, ...calculateCartTotals(items, state.discounts) };
           }),
 
         updateItem: (itemId, updates) =>
           set((state) => {
-            const newItems = state.items.map((i) => (i.id === itemId ? { ...i, ...updates } : i));
-            const subtotal = newItems.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { items: newItems, subtotal, discountAmount, taxAmount, totalAmount };
+            const items = state.items.map((i) => (i.id === itemId ? { ...i, ...updates } : i));
+            return { items, ...calculateCartTotals(items, state.discounts) };
           }),
 
         incrementQuantity: (itemId) =>
           set((state) => {
-            const newItems = state.items.map((i) =>
+            const items = state.items.map((i) =>
               i.id === itemId ? { ...i, quantity: i.quantity + 1 } : i
             );
-            const subtotal = newItems.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { items: newItems, subtotal, discountAmount, taxAmount, totalAmount };
+            return { items, ...calculateCartTotals(items, state.discounts) };
           }),
 
         decrementQuantity: (itemId) =>
           set((state) => {
-            const newItems = state.items
-              .map((i) => (i.id === itemId ? { ...i, quantity: Math.max(1, i.quantity - 1) } : i))
+            const items = state.items
+              .map((i) =>
+                i.id === itemId ? { ...i, quantity: Math.max(1, i.quantity - 1) } : i
+              )
               .filter((i) => i.quantity > 0);
-
-            const subtotal = newItems.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { items: newItems, subtotal, discountAmount, taxAmount, totalAmount };
+            return { items, ...calculateCartTotals(items, state.discounts) };
           }),
 
         applyDiscount: (type, value, code) =>
           set((state) => {
-            const newDiscounts = [...state.discounts, { type, value, code }];
-            const subtotal = state.items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = newDiscounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { discounts: newDiscounts, discountAmount, taxAmount, totalAmount };
+            const discounts = [...state.discounts, { type, value, code }];
+            return { discounts, ...calculateCartTotals(state.items, discounts) };
           }),
 
         removeDiscount: (index) =>
           set((state) => {
-            const newDiscounts = state.discounts.filter((_, i) => i !== index);
-            const subtotal = state.items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = newDiscounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { discounts: newDiscounts, discountAmount, taxAmount, totalAmount };
+            const discounts = state.discounts.filter((_, i) => i !== index);
+            return { discounts, ...calculateCartTotals(state.items, discounts) };
           }),
 
         setCustomer: (name, phone, id) =>
+          set({ customerName: name, customerPhone: phone, customerId: id }),
+
+        clear: () =>
           set({
-            customerName: name,
-            customerPhone: phone,
-            customerId: id,
+            ...initialState,
+            // Generate a fresh UUID for the next checkout session
+            checkoutUUID: generateUUID(),
           }),
 
-        clear: () => set(initialState),
-
-        calculateTotals: () =>
-          set((state) => {
-            const subtotal = state.items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { subtotal, discountAmount, taxAmount, totalAmount };
-          }),
+        regenerateCheckoutUUID: () =>
+          set({ checkoutUUID: generateUUID() }),
       }),
       {
         name: 'cart-store',
-        partialize: (state) => ({ items: state.items, customerId: state.customerId }),
+        partialize: (state) => ({
+          items: state.items,
+          discounts: state.discounts,
+          customerId: state.customerId,
+          checkoutUUID: state.checkoutUUID,
+        }),
       }
     )
   )
