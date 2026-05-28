@@ -1,33 +1,26 @@
 import { create } from 'zustand';
 import { devtools, persist } from 'zustand/middleware';
+import { v4 as uuidv4 } from 'uuid';
+import {
+  calculateCartTotals,
+  CartItem,
+  CartDiscount,
+  CartTotals,
+} from '@/lib/cartUtils';
 
-export interface CartItem {
-  id: string;
-  productId: number;
-  productVariantId?: number;
-  name: string;
-  sku: string;
-  quantity: number;
-  unitPrice: number;
-  discount: number;
-  notes?: string;
-  image?: string;
-}
+// Re-export CartItem so existing imports don't break
+export type { CartItem };
 
-export interface CartState {
+export interface CartState extends CartTotals {
   items: CartItem[];
-  subtotal: number;
-  discountAmount: number;
-  taxAmount: number;
-  totalAmount: number;
   customerName?: string;
   customerPhone?: string;
   customerId?: number;
-  discounts: Array<{ type: 'PERCENTAGE' | 'FIXED'; value: number; code?: string }>;
+  discounts: CartDiscount[];
 }
 
 interface CartActions {
-  addItem: (item: CartItem) => void;
+  addItem: (item: Omit<CartItem, 'id'>) => void;
   removeItem: (itemId: string) => void;
   updateItem: (itemId: string, updates: Partial<CartItem>) => void;
   incrementQuantity: (itemId: string) => void;
@@ -39,13 +32,17 @@ interface CartActions {
   calculateTotals: () => void;
 }
 
-const initialState: CartState = {
-  items: [],
+const EMPTY_TOTALS: CartTotals = {
   subtotal: 0,
   discountAmount: 0,
   taxAmount: 0,
   totalAmount: 0,
+};
+
+const initialState: CartState = {
+  items: [],
   discounts: [],
+  ...EMPTY_TOTALS,
 };
 
 export const useCartStore = create<CartState & CartActions>()(
@@ -56,7 +53,6 @@ export const useCartStore = create<CartState & CartActions>()(
 
         addItem: (item) =>
           set((state) => {
-            // Check if item already exists (same product + variant)
             const existingIndex = state.items.findIndex(
               (i) =>
                 i.productId === item.productId &&
@@ -65,58 +61,40 @@ export const useCartStore = create<CartState & CartActions>()(
 
             let newItems: CartItem[];
             if (existingIndex >= 0) {
-              // Increment quantity of existing item
               newItems = [...state.items];
-              newItems[existingIndex].quantity += item.quantity;
+              newItems[existingIndex] = {
+                ...newItems[existingIndex],
+                quantity: newItems[existingIndex].quantity + item.quantity,
+              };
             } else {
-              // Add new item with unique ID
-              newItems = [...state.items, { ...item, id: `${Date.now()}-${Math.random()}` }];
+              // Use crypto UUID — safe for deduplication and audit sync flows
+              newItems = [...state.items, { ...item, id: uuidv4() }];
             }
-
-            // Recalculate totals after adding
-            const subtotal = newItems.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1; // 10% tax
-            const totalAmount = subtotal - discountAmount + taxAmount;
 
             return {
               items: newItems,
-              subtotal,
-              discountAmount,
-              taxAmount,
-              totalAmount,
+              ...calculateCartTotals(newItems, state.discounts),
             };
           }),
 
         removeItem: (itemId) =>
           set((state) => {
             const newItems = state.items.filter((i) => i.id !== itemId);
-            const subtotal = newItems.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { items: newItems, subtotal, discountAmount, taxAmount, totalAmount };
+            return {
+              items: newItems,
+              ...calculateCartTotals(newItems, state.discounts),
+            };
           }),
 
         updateItem: (itemId, updates) =>
           set((state) => {
-            const newItems = state.items.map((i) => (i.id === itemId ? { ...i, ...updates } : i));
-            const subtotal = newItems.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { items: newItems, subtotal, discountAmount, taxAmount, totalAmount };
+            const newItems = state.items.map((i) =>
+              i.id === itemId ? { ...i, ...updates } : i
+            );
+            return {
+              items: newItems,
+              ...calculateCartTotals(newItems, state.discounts),
+            };
           }),
 
         incrementQuantity: (itemId) =>
@@ -124,60 +102,43 @@ export const useCartStore = create<CartState & CartActions>()(
             const newItems = state.items.map((i) =>
               i.id === itemId ? { ...i, quantity: i.quantity + 1 } : i
             );
-            const subtotal = newItems.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { items: newItems, subtotal, discountAmount, taxAmount, totalAmount };
+            return {
+              items: newItems,
+              ...calculateCartTotals(newItems, state.discounts),
+            };
           }),
 
         decrementQuantity: (itemId) =>
           set((state) => {
             const newItems = state.items
-              .map((i) => (i.id === itemId ? { ...i, quantity: Math.max(1, i.quantity - 1) } : i))
+              .map((i) =>
+                i.id === itemId
+                  ? { ...i, quantity: Math.max(1, i.quantity - 1) }
+                  : i
+              )
               .filter((i) => i.quantity > 0);
-
-            const subtotal = newItems.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { items: newItems, subtotal, discountAmount, taxAmount, totalAmount };
+            return {
+              items: newItems,
+              ...calculateCartTotals(newItems, state.discounts),
+            };
           }),
 
         applyDiscount: (type, value, code) =>
           set((state) => {
             const newDiscounts = [...state.discounts, { type, value, code }];
-            const subtotal = state.items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = newDiscounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { discounts: newDiscounts, discountAmount, taxAmount, totalAmount };
+            return {
+              discounts: newDiscounts,
+              ...calculateCartTotals(state.items, newDiscounts),
+            };
           }),
 
         removeDiscount: (index) =>
           set((state) => {
             const newDiscounts = state.discounts.filter((_, i) => i !== index);
-            const subtotal = state.items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = newDiscounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { discounts: newDiscounts, discountAmount, taxAmount, totalAmount };
+            return {
+              discounts: newDiscounts,
+              ...calculateCartTotals(state.items, newDiscounts),
+            };
           }),
 
         setCustomer: (name, phone, id) =>
@@ -190,21 +151,17 @@ export const useCartStore = create<CartState & CartActions>()(
         clear: () => set(initialState),
 
         calculateTotals: () =>
-          set((state) => {
-            const subtotal = state.items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-            const discountAmount = state.discounts.reduce((sum, d) => {
-              if (d.type === 'PERCENTAGE') return sum + (subtotal * d.value) / 100;
-              return sum + d.value;
-            }, 0);
-            const taxAmount = (subtotal - discountAmount) * 0.1;
-            const totalAmount = subtotal - discountAmount + taxAmount;
-
-            return { subtotal, discountAmount, taxAmount, totalAmount };
-          }),
+          set((state) => ({
+            ...calculateCartTotals(state.items, state.discounts),
+          })),
       }),
       {
         name: 'cart-store',
-        partialize: (state) => ({ items: state.items, customerId: state.customerId }),
+        partialize: (state) => ({
+          items: state.items,
+          discounts: state.discounts,
+          customerId: state.customerId,
+        }),
       }
     )
   )

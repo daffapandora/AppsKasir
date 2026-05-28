@@ -1,56 +1,81 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 /**
- * Middleware for tenant context isolation and authentication
- * Enforces multi-tenancy, protects routes, and sets tenant headers
+ * Next.js Edge Middleware — route protection only.
+ *
+ * WHAT THIS FILE DOES:
+ *  - Redirects unauthenticated users to /login
+ *  - Redirects authenticated users away from /login and /register
+ *  - Stubs role-aware guard (TODO: expand as role cookie is implemented)
+ *
+ * WHAT THIS FILE DOES NOT DO (and should not do):
+ *  - Set auth/tenant/outlet headers on API requests
+ *    → That is handled by apiFetch() in src/lib/apiFetch.ts
+ *    → Middleware runs on the *response* object; headers set here are
+ *      NOT inherited by subsequent browser fetch() calls.
+ *
+ * TOKEN VALIDATION NOTE:
+ *  Currently we only check for cookie *presence*. A future improvement
+ *  is to verify the token with a lightweight server-side check here
+ *  (e.g., calling /api/v1/auth/verify) so expired tokens redirect to
+ *  login before the user sees protected UI. Tracked in GitHub Issue.
  */
 export function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
 
-  // Public routes that don't require authentication
-  const publicRoutes = ['/login', '/register', '/forgot-password', '/', '/api/auth'];
-  const isPublicRoute = publicRoutes.some((route) => pathname.startsWith(route));
+  // Routes that do not require authentication
+  const publicRoutes = [
+    '/login',
+    '/register',
+    '/forgot-password',
+    '/',
+    '/api/auth',
+  ];
+  const isPublicRoute = publicRoutes.some((route) =>
+    pathname.startsWith(route)
+  );
 
-  // Get auth token from cookies
   const authToken = request.cookies.get('auth_token')?.value;
-  const tenantId = request.cookies.get('tenant_id')?.value;
-  const outletId = request.cookies.get('outlet_id')?.value;
+  const userRole = request.cookies.get('user_role')?.value;
 
-  // Redirect to login if not authenticated and trying to access protected route
+  // 1. Redirect unauthenticated users away from protected routes
   if (!isPublicRoute && !authToken) {
     const loginUrl = new URL('/login', request.url);
     loginUrl.searchParams.set('redirect', pathname);
     return NextResponse.redirect(loginUrl);
   }
 
-  // Redirect to POS if authenticated and trying to access login/register
-  if (isPublicRoute && authToken && (pathname === '/login' || pathname === '/register')) {
+  // 2. Redirect authenticated users away from auth pages
+  if (
+    isPublicRoute &&
+    authToken &&
+    (pathname === '/login' || pathname === '/register')
+  ) {
     return NextResponse.redirect(new URL('/pos', request.url));
   }
 
-  // Create response
-  const response = NextResponse.next();
+  // 3. Role-based route guards
+  //    Expand this as manager/owner/admin routes are implemented.
+  const managerRoutes = ['/manager', '/reports', '/settings/users'];
+  const ownerRoutes = ['/owner', '/settings/outlets', '/settings/billing'];
 
-  // Set tenant context headers for API calls
-  if (tenantId) {
-    response.headers.set('X-Tenant-ID', tenantId);
+  const isManagerRoute = managerRoutes.some((r) => pathname.startsWith(r));
+  const isOwnerRoute = ownerRoutes.some((r) => pathname.startsWith(r));
+
+  if (isManagerRoute && userRole === 'CASHIER') {
+    return NextResponse.redirect(new URL('/pos', request.url));
   }
 
-  if (outletId) {
-    response.headers.set('X-Outlet-ID', outletId);
+  if (isOwnerRoute && userRole !== 'OWNER') {
+    return NextResponse.redirect(new URL('/pos', request.url));
   }
 
-  if (authToken) {
-    response.headers.set('Authorization', `Bearer ${authToken}`);
-  }
-
-  return response;
+  // Allow the request to proceed — do NOT set headers on response here.
+  return NextResponse.next();
 }
 
-// Configure which routes should use middleware
 export const config = {
   matcher: [
-    // Protect all routes except static files and public assets
     '/((?!_next/static|_next/image|favicon.ico|manifest.json|robots.txt|sw.js).*)',
   ],
 };
