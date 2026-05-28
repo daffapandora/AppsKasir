@@ -1,26 +1,32 @@
-/**
- * Offline sync state store.
- *
- * IMPORTANT: This store no longer owns the Dexie DB schema or the
- * online/offline event listeners. Those now live in `@/lib/db.ts`.
- *
- * To wire up connectivity detection, call useConnectivitySync() from
- * `@/lib/db.ts` once in your top-level layout component:
- *
- *   import { useConnectivitySync } from '@/lib/db';
- *   import { useOfflineSyncStore } from '@/stores/offlineSyncStore';
- *
- *   export default function RootLayout({ children }) {
- *     const setOnline = useOfflineSyncStore((s) => s.setOnline);
- *     useConnectivitySync(setOnline);
- *     return <>{children}</>;
- *   }
- */
-
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
-import { db } from '@/lib/db';
-import { apiFetch } from '@/lib/apiFetch';
+import Dexie, { Table } from 'dexie';
+import { apiFetch } from '@/lib/apiClient';
+
+// ---------------------------------------------------------------------------
+// Dexie DB — defined outside the store to avoid re-instantiation
+// ---------------------------------------------------------------------------
+
+export class OfflineDB extends Dexie {
+  products!: Table<any>;
+  categories!: Table<any>;
+  transactions!: Table<any>;
+
+  constructor() {
+    super('KasirDB');
+    this.version(1).stores({
+      products: 'id, sku, barcode, tenant_id',
+      categories: 'id, tenant_id',
+      transactions: 'id, client_uuid, status, tenant_id, created_at',
+    });
+  }
+}
+
+export const db = new OfflineDB();
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 export interface SyncState {
   isOnline: boolean;
@@ -34,7 +40,7 @@ export interface SyncState {
 interface SyncActions {
   setOnline: (online: boolean) => void;
   setSyncing: (syncing: boolean) => void;
-  setLastSyncTime: (time: Date) => void;
+  setLastSyncTime: (time?: Date) => void;
   setPendingTransactions: (count: number) => void;
   setSyncError: (error?: string) => void;
   setMasterDataCached: (cached: boolean) => void;
@@ -43,9 +49,12 @@ interface SyncActions {
   retryFailedSync: () => Promise<void>;
 }
 
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
 export const useOfflineSyncStore = create<SyncState & SyncActions>()(
   devtools((set, get) => ({
-    // Initial state — no side effects here (listeners moved to lib/db.ts)
     isOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
     isSyncing: false,
     lastSyncTime: undefined,
@@ -62,51 +71,42 @@ export const useOfflineSyncStore = create<SyncState & SyncActions>()(
 
     /**
      * Pull master data (products, categories) from server and cache in Dexie.
-     * Auth/tenant headers are injected automatically by apiFetch().
+     * Uses apiFetch() so auth + tenant headers are always attached.
      */
     pullMasterData: async () => {
       set({ isSyncing: true, syncError: undefined });
-
       try {
         const response = await apiFetch('/api/v1/sync/master-data');
-
         if (!response.ok) {
           throw new Error(`Failed to pull master data: ${response.statusText}`);
         }
 
-        const { data } = await response.json();
+        const data = await response.json();
 
         await db.transaction('rw', db.products, db.categories, async () => {
           await db.products.clear();
           await db.categories.clear();
-
-          if (data.categories?.length > 0) {
-            await db.categories.bulkAdd(data.categories);
+          if (Array.isArray(data.categories) && data.categories.length > 0) {
+            await db.categories.bulkPut(data.categories);
           }
-          if (data.products?.length > 0) {
-            await db.products.bulkAdd(data.products);
+          if (Array.isArray(data.products) && data.products.length > 0) {
+            await db.products.bulkPut(data.products);
           }
         });
 
-        set({
-          masterDataCached: true,
-          lastSyncTime: new Date(),
-          isSyncing: false,
-        });
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : 'Unknown sync error';
-        set({ isSyncing: false, syncError: message });
+        set({ masterDataCached: true, lastSyncTime: new Date(), isSyncing: false });
+      } catch (error: any) {
+        set({ isSyncing: false, syncError: error?.message ?? 'Failed to pull master data' });
         throw error;
       }
     },
 
     /**
      * Push PENDING_SYNC transactions to server in batches.
-     * Auth/tenant headers injected by apiFetch().
+     * Marks each batch as SYNCED on success.
      */
     pushPendingTransactions: async () => {
       set({ isSyncing: true, syncError: undefined });
-
       try {
         const transactions = await db.transactions
           .where('status')
@@ -114,7 +114,7 @@ export const useOfflineSyncStore = create<SyncState & SyncActions>()(
           .toArray();
 
         if (transactions.length === 0) {
-          set({ isSyncing: false });
+          set({ isSyncing: false, pendingTransactions: 0 });
           return;
         }
 
@@ -131,14 +131,17 @@ export const useOfflineSyncStore = create<SyncState & SyncActions>()(
             throw new Error(`Failed to push transactions: ${response.statusText}`);
           }
 
-          const { synced_ids } = await response.json();
+          const result = await response.json();
+          const syncedIds: number[] = result.synced_ids ?? [];
 
-          await db.transactions.bulkUpdate(
-            synced_ids.map((id: number) => ({
-              key: id,
-              changes: { status: 'SYNCED', synced_at: new Date() },
-            }))
-          );
+          if (syncedIds.length > 0) {
+            await db.transactions.bulkUpdate(
+              syncedIds.map((id) => ({
+                key: id,
+                changes: { status: 'SYNCED', synced_at: new Date() },
+              }))
+            );
+          }
         }
 
         const pending = await db.transactions
@@ -146,21 +149,15 @@ export const useOfflineSyncStore = create<SyncState & SyncActions>()(
           .equals('PENDING_SYNC')
           .count();
 
-        set({
-          isSyncing: false,
-          lastSyncTime: new Date(),
-          pendingTransactions: pending,
-        });
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : 'Unknown sync error';
-        set({ isSyncing: false, syncError: message });
+        set({ isSyncing: false, lastSyncTime: new Date(), pendingTransactions: pending });
+      } catch (error: any) {
+        set({ isSyncing: false, syncError: error?.message ?? 'Failed to push transactions' });
         throw error;
       }
     },
 
     /**
      * Retry failed sync with exponential backoff.
-     * No longer reads from localStorage — tenant context comes from cookies via apiFetch.
      */
     retryFailedSync: async () => {
       let delay = 1000;
@@ -169,15 +166,14 @@ export const useOfflineSyncStore = create<SyncState & SyncActions>()(
 
       while (attempts < maxAttempts) {
         try {
-          if (get().isOnline) {
-            await get().pushPendingTransactions();
-            return;
-          }
+          if (!get().isOnline) throw new Error('Device is offline');
+          await get().pushPendingTransactions();
+          return;
+        } catch {
+          attempts += 1;
+          if (attempts >= maxAttempts) break;
           await new Promise((resolve) => setTimeout(resolve, delay));
           delay *= 2;
-          attempts++;
-        } catch {
-          attempts++;
         }
       }
 
@@ -185,3 +181,20 @@ export const useOfflineSyncStore = create<SyncState & SyncActions>()(
     },
   }))
 );
+
+// ---------------------------------------------------------------------------
+// Connectivity listeners — call once at app root (e.g. in layout.tsx)
+// Kept separate to prevent duplicate bindings on hot-reload / re-imports
+// ---------------------------------------------------------------------------
+
+let listenersRegistered = false;
+
+export function registerConnectivityListeners(): void {
+  if (typeof window === 'undefined' || listenersRegistered) return;
+
+  const { setOnline } = useOfflineSyncStore.getState();
+  window.addEventListener('online', () => setOnline(true));
+  window.addEventListener('offline', () => setOnline(false));
+
+  listenersRegistered = true;
+}
