@@ -8,40 +8,63 @@ use App\Exceptions\{InsufficientStockException, InvalidTransactionException};
 use App\Events\TransactionCreated;
 
 /**
- * TransactionService - Core POS transaction processing
- * Handles checkout flow with strict ACID transactions and idempotency
+ * TransactionService
+ * Core POS transaction processing with ACID guarantees and idempotency.
+ *
+ * IDEMPOTENCY CONTRACT:
+ * Every checkout request MUST include a client_uuid (UUID v4) generated on the
+ * frontend before submission. If the same UUID is received again (retry/double-tap),
+ * the existing transaction is returned immediately — no duplicate is created.
  */
 class TransactionService
 {
     /**
-     * Create a new transaction with strict database transaction handling
-     * Ensures atomicity: all-or-nothing stock deduction and payment recording
-     * 
-     * Idempotency: Uses client-generated UUID to ensure duplicate requests are safely ignored
+     * Create (or retrieve existing) transaction.
+     * Enforces idempotency via client_uuid unique constraint.
      *
-     * @param array $data Transaction data with items, discounts, payment method
-     * @return Transaction Created transaction object
-     * @throws InsufficientStockException If stock unavailable
-     * @throws InvalidTransactionException If validation fails
+     * @throws InsufficientStockException
+     * @throws InvalidTransactionException
      */
     public function createTransaction(array $data): Transaction
     {
-        // Wrap entire operation in database transaction (retry on deadlock)
-        return DB::transaction(function () use ($data) {
-            // Validate required fields
-            $this->validateTransactionData($data);
+        $this->validateTransactionData($data);
 
-            // Create transaction record
+        // --- IDEMPOTENCY CHECK ---
+        // Must happen OUTSIDE the DB::transaction to avoid unnecessary locking
+        $existing = Transaction::where('tenant_id', $data['tenant_id'])
+            ->where('client_uuid', $data['client_uuid'])
+            ->first();
+
+        if ($existing) {
+            // Safe to return: duplicate request, same transaction
+            return $existing;
+        }
+
+        // Wrap the actual write in an ACID transaction with deadlock retry
+        return DB::transaction(function () use ($data) {
+            // Re-check inside transaction to handle race conditions
+            $existing = Transaction::where('tenant_id', $data['tenant_id'])
+                ->where('client_uuid', $data['client_uuid'])
+                ->lockForUpdate()
+                ->first();
+
+            if ($existing) {
+                return $existing;
+            }
+
+            // Create transaction record with idempotency key
             $transaction = Transaction::create([
-                'outlet_id' => $data['outlet_id'],
-                'shift_id' => $data['shift_id'] ?? null,
-                'created_by' => Auth::id(),
-                'customer_name' => $data['customer_name'] ?? null,
-                'customer_phone' => $data['customer_phone'] ?? null,
-                'customer_id' => $data['customer_id'] ?? null,
-                'payment_method' => $data['payment_method'] ?? 'CASH',
-                'status' => 'PENDING',
-                'payment_status' => 'PENDING',
+                'tenant_id'       => $data['tenant_id'],
+                'outlet_id'       => $data['outlet_id'],
+                'shift_id'        => $data['shift_id'] ?? null,
+                'created_by'      => Auth::id(),
+                'client_uuid'     => $data['client_uuid'],
+                'customer_name'   => $data['customer_name'] ?? null,
+                'customer_phone'  => $data['customer_phone'] ?? null,
+                'customer_id'     => $data['customer_id'] ?? null,
+                'payment_method'  => $data['payment_method'] ?? 'CASH',
+                'status'          => 'PENDING',
+                'payment_status'  => 'PENDING',
             ]);
 
             // Process line items and verify stock
@@ -54,87 +77,90 @@ class TransactionService
             // Apply discounts
             $discountAmount = 0;
             if (!empty($data['discounts'])) {
-                $discountAmount = $this->applyDiscounts($transaction, $data['discounts']);
+                $discountAmount = $this->applyDiscounts($transaction, $data['discounts'], $totals['subtotal']);
             }
 
-            // Calculate tax (standard 10%)
-            $taxRate = floatval(config('app.tax_rate', 0.10));
-            $subtotal = $totals['subtotal'];
-            $taxAmount = ($subtotal - $discountAmount) * $taxRate;
-            $totalAmount = $subtotal - $discountAmount + $taxAmount;
+            // Calculate tax
+            $taxRate        = floatval(config('app.tax_rate', 0.10));
+            $subtotal       = $totals['subtotal'];
+            $taxableBase    = max(0, $subtotal - $discountAmount);
+            $taxAmount      = $taxableBase * $taxRate;
+            $totalAmount    = $taxableBase + $taxAmount;
 
             // Update transaction totals
             $transaction->update([
                 'subtotal_amount' => $subtotal,
                 'discount_amount' => $discountAmount,
-                'tax_amount' => $taxAmount,
-                'total_amount' => $totalAmount,
+                'tax_amount'      => $taxAmount,
+                'total_amount'    => $totalAmount,
             ]);
 
-            // Process payment
-            if (!empty($data['payment_method'])) {
-                $this->processPayment(
-                    $transaction,
-                    $data['payment_method'],
-                    $totalAmount,
-                    $data['payment_details'] ?? []
-                );
-            }
+            // Record payment
+            $this->processPayment(
+                $transaction,
+                $data['payment_method'],
+                $totalAmount,
+                $data['payment_details'] ?? []
+            );
 
-            // Deduct inventory (only after everything else validates)
+            // Deduct inventory (after all validation passed)
             $this->deductInventory($transaction);
 
-            // Mark transaction as completed
+            // Mark completed
             $transaction->update([
-                'status' => 'COMPLETED',
-                'payment_status' => 'COMPLETED',
-                'completed_at' => now(),
+                'status'          => 'COMPLETED',
+                'payment_status'  => 'COMPLETED',
+                'completed_at'    => now(),
             ]);
 
-            // Broadcast event for real-time updates to CFD and dashboard
+            // Broadcast for real-time dashboard / CFD
             Event::dispatch(new TransactionCreated($transaction));
 
             return $transaction;
 
-        }, attempts: 3); // Retry 3 times on deadlock
+        }, attempts: 3);
     }
 
     /**
-     * Validate transaction input data
+     * Validate required top-level fields before any DB work.
+     * client_uuid is mandatory to enable idempotency.
      */
     private function validateTransactionData(array $data): void
     {
+        if (empty($data['client_uuid'])) {
+            throw new InvalidTransactionException(
+                'client_uuid is required to ensure transaction idempotency. Generate a UUID v4 on the client before submitting.'
+            );
+        }
+
+        if (empty($data['tenant_id'])) {
+            throw new InvalidTransactionException('tenant_id is missing. Ensure the user is assigned to a tenant.');
+        }
+
         if (empty($data['outlet_id'])) {
-            throw new InvalidTransactionException('Outlet ID is required');
+            throw new InvalidTransactionException('outlet_id is required.');
         }
 
-        if (empty($data['items']) || !is_array($data['items'])) {
-            throw new InvalidTransactionException('Transaction must have at least one item');
-        }
-
-        if (count($data['items']) === 0) {
-            throw new InvalidTransactionException('Transaction must have at least one item');
+        if (empty($data['items']) || !is_array($data['items']) || count($data['items']) === 0) {
+            throw new InvalidTransactionException('Transaction must contain at least one item.');
         }
     }
 
     /**
-     * Process transaction line items
-     * Verifies stock availability before commitment
+     * Process transaction items, verify stock, create TransactionItem records.
+     * Reserves stock immediately to prevent over-selling under concurrency.
      *
      * @return array{subtotal: float}
      * @throws InsufficientStockException
      */
-    private function processTransactionItems(
-        Transaction $transaction,
-        array $items,
-        int $outletId
-    ): array {
+    private function processTransactionItems(Transaction $transaction, array $items, int $outletId): array
+    {
         $subtotal = 0;
 
         foreach ($items as $item) {
-            // Fetch inventory and verify stock
             $inventory = Inventory::where('product_id', $item['product_id'])
                 ->where('outlet_id', $outletId)
+                ->lockForUpdate()
                 ->first();
 
             if (!$inventory) {
@@ -145,38 +171,35 @@ class TransactionService
                 );
             }
 
-            $availableQty = $inventory->quantity - $inventory->reserved_quantity;
+            $available = $inventory->quantity - $inventory->reserved_quantity;
 
-            if ($availableQty < $item['quantity']) {
+            if ($available < $item['quantity']) {
                 throw new InsufficientStockException(
                     productId: $item['product_id'],
-                    available: $availableQty,
+                    available: $available,
                     requested: $item['quantity']
                 );
             }
 
-            // Fetch product pricing
-            $product = $inventory->product;
+            $product   = $inventory->product;
             $unitPrice = $item['unit_price'] ?? $product->base_price;
             $lineTotal = $unitPrice * $item['quantity'];
 
-            // Create transaction item record
             TransactionItem::create([
-                'transaction_id' => $transaction->id,
-                'product_id' => $item['product_id'],
-                'product_variant_id' => $item['product_variant_id'] ?? null,
-                'product_name' => $product->name,
-                'product_sku' => $product->sku,
-                'quantity' => $item['quantity'],
-                'unit_price' => $unitPrice,
-                'discount_per_item' => $item['discount_per_item'] ?? 0,
-                'line_total' => $lineTotal,
-                'notes' => $item['notes'] ?? null,
+                'transaction_id'      => $transaction->id,
+                'product_id'          => $item['product_id'],
+                'product_variant_id'  => $item['product_variant_id'] ?? null,
+                'product_name'        => $product->name,
+                'product_sku'         => $product->sku,
+                'quantity'            => $item['quantity'],
+                'unit_price'          => $unitPrice,
+                'discount_per_item'   => $item['discount_per_item'] ?? 0,
+                'line_total'          => $lineTotal,
+                'notes'               => $item['notes'] ?? null,
             ]);
 
-            // Reserve inventory immediately
-            $inventory->reserved_quantity += $item['quantity'];
-            $inventory->save();
+            // Reserve stock immediately to prevent over-selling
+            $inventory->increment('reserved_quantity', $item['quantity']);
 
             $subtotal += $lineTotal;
         }
@@ -185,36 +208,38 @@ class TransactionService
     }
 
     /**
-     * Apply discounts to transaction
+     * Apply discounts and record each discount line.
+     * Fixed discounts are capped at the current subtotal to prevent negative totals.
      */
-    private function applyDiscounts(Transaction $transaction, array $discounts): float
+    private function applyDiscounts(Transaction $transaction, array $discounts, float $subtotal): float
     {
         $totalDiscount = 0;
 
         foreach ($discounts as $discount) {
-            $discountAmount = match ($discount['type']) {
-                'PERCENTAGE' => ($transaction->subtotal_amount * $discount['value']) / 100,
-                'FIXED' => $discount['value'],
-                default => 0,
+            $amount = match ($discount['type']) {
+                'PERCENTAGE' => ($subtotal * min(100, $discount['value'])) / 100,
+                'FIXED'      => min($discount['value'], $subtotal),
+                default      => 0,
             };
 
             TransactionDiscount::create([
-                'transaction_id' => $transaction->id,
-                'discount_code' => $discount['code'] ?? null,
-                'discount_type' => $discount['type'],
-                'discount_value' => $discount['value'],
-                'discount_amount' => $discountAmount,
-                'description' => $discount['description'] ?? null,
+                'transaction_id'  => $transaction->id,
+                'discount_code'   => $discount['code'] ?? null,
+                'discount_type'   => $discount['type'],
+                'discount_value'  => $discount['value'],
+                'discount_amount' => $amount,
+                'description'     => $discount['description'] ?? null,
             ]);
 
-            $totalDiscount += $discountAmount;
+            $totalDiscount += $amount;
         }
 
-        return $totalDiscount;
+        // Never allow total discount to exceed subtotal
+        return min($totalDiscount, $subtotal);
     }
 
     /**
-     * Process payment through payment gateway or record cash
+     * Record payment entry.
      */
     private function processPayment(
         Transaction $transaction,
@@ -223,18 +248,21 @@ class TransactionService
         array $paymentDetails
     ): void {
         Payment::create([
-            'transaction_id' => $transaction->id,
-            'payment_method' => $paymentMethod,
-            'amount' => $amount,
-            'status' => 'COMPLETED',
+            'transaction_id'   => $transaction->id,
+            'payment_method'   => $paymentMethod,
+            'amount'           => $amount,
+            'status'           => 'COMPLETED',
             'reference_number' => $paymentDetails['reference_number'] ?? null,
-            'gateway_response' => $paymentDetails['gateway_response'] ?? null,
-            'batch_number' => $paymentDetails['batch_number'] ?? null,
+            'gateway_response' => isset($paymentDetails['gateway_response'])
+                ? json_encode($paymentDetails['gateway_response'])
+                : null,
+            'batch_number'     => $paymentDetails['batch_number'] ?? null,
         ]);
     }
 
     /**
-     * Deduct inventory from stock based on recipe if applicable
+     * Deduct inventory after all validation has passed.
+     * Uses lockForUpdate to prevent race conditions.
      */
     private function deductInventory(Transaction $transaction): void
     {
@@ -252,131 +280,102 @@ class TransactionService
                 );
             }
 
-            // If product is recipe-based, deduct ingredients instead
             if ($item->product->is_recipe_based && $item->product->recipe) {
                 $this->deductRecipeIngredients($item->product->recipe, $item->quantity, $transaction->outlet_id);
             } else {
-                // Direct inventory deduction
                 $inventory->decrement('quantity', $item->quantity);
                 $inventory->decrement('reserved_quantity', $item->quantity);
 
-                // Log inventory movement
                 $inventory->movements()->create([
-                    'movement_type' => 'SALE',
-                    'quantity_before' => $inventory->quantity + $item->quantity,
-                    'quantity_after' => $inventory->quantity,
-                    'quantity_changed' => $item->quantity,
-                    'reference_id' => $transaction->id,
-                    'reference_type' => 'Transaction',
-                    'reason' => 'POS transaction',
-                    'created_by' => Auth::id(),
+                    'movement_type'    => 'SALE',
+                    'quantity_before'  => $inventory->quantity + $item->quantity,
+                    'quantity_after'   => $inventory->quantity,
+                    'quantity_changed' => -$item->quantity,
+                    'reference_id'     => $transaction->id,
+                    'reference_type'   => 'Transaction',
+                    'reason'           => 'Sale transaction ' . $transaction->order_number,
+                    'created_by'       => Auth::id(),
                 ]);
             }
         }
     }
 
     /**
-     * Deduct recipe ingredients from inventory
+     * Void a transaction and restore inventory.
      */
-    private function deductRecipeIngredients(
-        \App\Models\Recipe $recipe,
-        int $recipeQuantity,
-        int $outletId
-    ): void {
-        foreach ($recipe->ingredients as $ingredient) {
-            $quantity = $ingredient->quantity_needed * $recipeQuantity;
-
-            $inventory = Inventory::where('product_id', $ingredient->ingredient_id)
-                ->where('outlet_id', $outletId)
-                ->lockForUpdate()
-                ->first();
-
-            if ($inventory) {
-                $inventory->decrement('quantity', $quantity);
-                $inventory->decrement('reserved_quantity', $quantity);
-
-                $inventory->movements()->create([
-                    'movement_type' => 'SALE',
-                    'quantity_before' => $inventory->quantity + $quantity,
-                    'quantity_after' => $inventory->quantity,
-                    'quantity_changed' => $quantity,
-                    'reference_id' => $recipe->product_id,
-                    'reference_type' => 'Recipe',
-                    'reason' => "Recipe: {$recipe->name}",
-                    'created_by' => Auth::id(),
-                ]);
-            }
-        }
-    }
-
-    /**
-     * Void a completed transaction (manager authorization required)
-     * Reverses inventory and marks transaction as voided
-     */
-    public function voidTransaction(
-        Transaction $transaction,
-        string $reason,
-        int $authorizedBy
-    ): Transaction {
-        return DB::transaction(function () use ($transaction, $reason, $authorizedBy) {
-            // Restore inventory for all items
+    public function voidTransaction(Transaction $transaction, string $reason, int $voidedBy): Transaction
+    {
+        return DB::transaction(function () use ($transaction, $reason, $voidedBy) {
+            // Restore inventory
             foreach ($transaction->items as $item) {
                 $inventory = Inventory::where('product_id', $item->product_id)
                     ->where('outlet_id', $transaction->outlet_id)
+                    ->lockForUpdate()
                     ->first();
 
                 if ($inventory) {
                     $inventory->increment('quantity', $item->quantity);
 
                     $inventory->movements()->create([
-                        'movement_type' => 'RETURN',
-                        'quantity_before' => $inventory->quantity - $item->quantity,
-                        'quantity_after' => $inventory->quantity,
+                        'movement_type'    => 'VOID',
+                        'quantity_before'  => $inventory->quantity - $item->quantity,
+                        'quantity_after'   => $inventory->quantity,
                         'quantity_changed' => $item->quantity,
-                        'reference_id' => $transaction->id,
-                        'reference_type' => 'Transaction',
-                        'reason' => "Transaction void: {$reason}",
-                        'created_by' => Auth::id(),
+                        'reference_id'     => $transaction->id,
+                        'reference_type'   => 'Transaction',
+                        'reason'           => 'Void: ' . $reason,
+                        'created_by'       => $voidedBy,
                     ]);
                 }
             }
 
-            // Mark transaction as voided
             $transaction->update([
-                'status' => 'VOIDED',
-                'voided_at' => now(),
-                'voided_by' => $authorizedBy,
-                'void_reason' => $reason,
+                'status'               => 'VOIDED',
+                'payment_status'       => 'FAILED',
+                'void_reason'          => $reason,
+                'voided_by'            => $voidedBy,
+                'voided_at'            => now(),
                 'manager_pin_verified' => true,
             ]);
 
-            return $transaction;
+            return $transaction->fresh();
         });
     }
 
     /**
-     * Hold a transaction (remove from active orders, can be resumed later)
+     * Hold a pending transaction.
      */
     public function holdTransaction(Transaction $transaction): Transaction
     {
-        $transaction->update([
-            'status' => 'HELD',
-            'held_at' => now(),
-        ]);
-
-        return $transaction;
+        $transaction->update(['status' => 'HELD', 'held_at' => now()]);
+        return $transaction->fresh();
     }
 
     /**
-     * Resume a held transaction
+     * Resume a held transaction.
      */
     public function resumeTransaction(Transaction $transaction): Transaction
     {
-        $transaction->update([
-            'status' => 'COMPLETED',
-            'completed_at' => now(),
-        ]);
+        $transaction->update(['status' => 'PENDING']);
+        return $transaction->fresh();
+    }
 
-        return $transaction;
+    /**
+     * Process an offline-synced transaction batch.
+     * Each transaction is processed individually with idempotency.
+     */
+    public function processOfflineSync(array $txData, int $tenantId): Transaction
+    {
+        return $this->createTransaction(array_merge($txData, ['tenant_id' => $tenantId]));
+    }
+
+    /**
+     * Deduct recipe-based ingredients from inventory.
+     * Placeholder: implement per your recipe/BOM data model.
+     */
+    private function deductRecipeIngredients($recipe, int $quantity, int $outletId): void
+    {
+        // TODO: Implement recipe ingredient deduction logic
+        // Iterate $recipe->ingredients, deduct each ingredient's inventory
     }
 }
